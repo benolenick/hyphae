@@ -1,0 +1,56 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hyphae"
+version = "0.1.0"
+description = "Self-organizing memory with gap-aware retrieval. Add facts, query gaps, the network grows itself."
+license = {text = "MIT"}
+requires-python = ">=3.10"
+authors = [
+    {name = "Ben Olenick"},
+]
+keywords = [
+    "memory",
+    "retrieval",
+    "manifold",
+    "geodesic",
+    "diffusion-maps",
+    "clustering",
+    "knowledge-base",
+    "rag",
+    "gap-detection",
+]
+classifiers = [
+    "Development Status :: 2 - Pre-Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Scientific/Engineering :: Information Analysis",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+]
+dependencies = [
+    "numpy>=1.24",
+    "scipy>=1.10",
+    "scikit-learn>=1.2",
+    "sentence-transformers>=2.2",
+]
+
+[project.optional-dependencies]
+faiss = ["faiss-cpu>=1.7"]
+server = ["fastapi>=0.100", "uvicorn>=0.20"]
+all = ["faiss-cpu>=1.7", "fastapi>=0.100", "uvicorn>=0.20"]
+
+[project.scripts]
+hyphae = "hyphae.server:run"
+
+[project.urls]
+Homepage = "https://github.com/benolenick/hyphae"
+Repository = "https://github.com/benolenick/hyphae"
+
+[tool.setuptools.packages.find]
+where = ["src"]
