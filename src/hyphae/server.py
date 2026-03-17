@@ -407,6 +407,13 @@ def stats():
 
 
 def run(host: str = "127.0.0.1", port: int = 8100):
-    """Start the Hyphae server."""
+    """Start the Hyphae server. Parses --host and --port from CLI args."""
+    import argparse
     import uvicorn
-    uvicorn.run(app, host=host, port=port)
+
+    parser = argparse.ArgumentParser(description="Hyphae memory server")
+    parser.add_argument("--host", default=host, help="Bind address (default: 127.0.0.1)")
+    parser.add_argument("--port", type=int, default=port, help="Port (default: 8100)")
+    args = parser.parse_args()
+
+    uvicorn.run(app, host=args.host, port=args.port)

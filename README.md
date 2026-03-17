@@ -19,58 +19,214 @@ Hyphae is a long-term memory server that stores knowledge as facts, clusters the
 ## Quick Start
 
 ```bash
-pip install hyphae[all]
+pip install hyphae-memory[all]
 hyphae
 ```
 
 This starts the server on `http://127.0.0.1:8100`. Facts are stored in `~/.hyphae/hyphae.db`.
 
-## API
-
-### Remember a fact
 ```bash
-curl -X POST http://127.0.0.1:8100/remember \
+# Custom port
+hyphae --port 9000
+
+# Bind to all interfaces (for remote access)
+hyphae --host 0.0.0.0 --port 8100
+```
+
+## CLI Agent Bootstrap
+
+If you're an AI agent and someone just pointed you at a Hyphae server, here's how to use it.
+
+### 1. Check if Hyphae is running
+
+```bash
+curl -s http://127.0.0.1:8100/health
+```
+
+If you get a JSON response with `"status": "ok"`, you're connected.
+
+### 2. Set your session scope
+
+Scope your session so your facts don't mix with other projects:
+
+```bash
+curl -s -X POST http://127.0.0.1:8100/session/set \
   -H "Content-Type: application/json" \
-  -d '{"text": "Redis CONFIG SET can write to authorized_keys for SSH access", "source": "agent"}'
+  -d '{"scope": {"project": "my-project-name"}}'
 ```
 
-### Recall facts
+### 3. Check what's already known
+
+Before starting work, recall relevant context:
+
 ```bash
-curl -X POST http://127.0.0.1:8100/recall \
+curl -s -X POST http://127.0.0.1:8100/recall \
   -H "Content-Type: application/json" \
-  -d '{"query": "SSH key injection", "top_k": 5}'
+  -d '{"query": "what has been done on this project", "top_k": 10}'
 ```
 
-### Scoped recall (project-specific)
+### 4. Save important things as you work
+
+When you make a decision, discover something, or solve a problem, save it:
+
 ```bash
-curl -X POST http://127.0.0.1:8100/recall \
+curl -s -X POST http://127.0.0.1:8100/remember \
   -H "Content-Type: application/json" \
-  -d '{"query": "deployment config", "top_k": 5, "scope": {"project": "myapp"}}'
+  -d '{"text": "The database migration requires running migrate.py before starting the app", "source": "agent"}'
 ```
 
-### Set session scope
+### 5. Before you end your session
+
+Save a summary of what you did:
+
 ```bash
-curl -X POST http://127.0.0.1:8100/session/set \
+curl -s -X POST http://127.0.0.1:8100/remember \
   -H "Content-Type: application/json" \
-  -d '{"scope": {"project": "myapp"}}'
+  -d '{"text": "Session summary: fixed the login bug by updating the JWT expiry check, deployed to staging, tests passing", "source": "agent"}'
 ```
 
-### Gap analysis
-```bash
-curl -X POST http://127.0.0.1:8100/analyze \
-  -H "Content-Type: application/json" \
-  -d '{"observations": ["found open port 6379", "Redis no auth"], "objective": "get shell access"}'
+### Agent integration pattern
+
+For any agent framework (LangChain, CrewAI, AutoGen, custom), the pattern is:
+
+```python
+import requests
+
+HYPHAE = "http://127.0.0.1:8100"
+
+def recall(query, top_k=5):
+    """Search memory before acting."""
+    r = requests.post(f"{HYPHAE}/recall", json={"query": query, "top_k": top_k})
+    return r.json().get("results", [])
+
+def remember(text, source="agent"):
+    """Save important facts after acting."""
+    requests.post(f"{HYPHAE}/remember", json={"text": text, "source": source})
+
+# At session start
+requests.post(f"{HYPHAE}/session/set", json={"scope": {"project": "my-project"}})
+context = recall("what was done last session")
+
+# During work
+remember("discovered that the API rate limits at 100 req/min")
+
+# When stuck
+from_memory = recall("how to handle rate limiting")
 ```
 
-### Health check
-```bash
-curl http://127.0.0.1:8100/health
+## HTTP API Reference
+
+### POST /remember
+Store a fact in memory.
+
+```json
+{
+  "text": "The fix for the 502 was adding proxy_pass to nginx",
+  "source": "agent",
+  "tags": {"project": "myapp", "type": "fix"},
+  "context_id": "session-123",
+  "cause_of": "fact-id-of-the-problem"
+}
 ```
 
-### Stats
-```bash
-curl http://127.0.0.1:8100/stats
+Returns: `{"id": "fact-uuid", "cluster_id": 42}`
+
+### POST /recall
+Search for facts by semantic similarity.
+
+```json
+{
+  "query": "nginx 502 error fix",
+  "top_k": 10,
+  "scope": {"project": "myapp"}
+}
 ```
+
+- Omit `scope` to use the session scope (set via `/session/set`)
+- Pass `"scope": {}` to search across ALL projects
+
+Returns: `{"results": [{"text": "...", "score": 0.87, "tags": {...}, ...}]}`
+
+### POST /session/set
+Set the active session scope. Auto-warms all facts in this scope.
+
+```json
+{"scope": {"project": "myapp"}}
+```
+
+### POST /session/clear
+Clear the session scope. Auto-distills a briefing before clearing.
+
+### POST /analyze
+Gap detection - find what's missing between observations and an objective.
+
+```json
+{
+  "observations": ["found open port 6379", "Redis no auth"],
+  "objective": "get shell access"
+}
+```
+
+Returns gaps with suggested facts to fill them.
+
+### GET /health
+Returns `{"status": "ok", "facts": 3042, "clusters": 296}`
+
+### GET /stats
+Detailed statistics: fact counts, cluster sizes, manifold coverage, FAISS status, background builder health.
+
+### POST /maintain
+Trigger manual maintenance: merge clusters, build manifolds, auto-distill, report decay stats.
+
+### GET /tower/list
+List all Ivory Towers.
+
+### GET /tower/walk/{name}
+Walk through all floors of a tower.
+
+### POST /tower/seed
+Create a new tower with initial floors.
+
+## MCP Server (Claude Code)
+
+Hyphae integrates with Claude Code via the Model Context Protocol. Start the HTTP server first, then add the MCP config.
+
+### Setup
+
+1. Start the Hyphae server:
+```bash
+hyphae
+```
+
+2. Add to your Claude Code MCP config (`~/.claude/settings.json` or project-level):
+```json
+{
+  "mcpServers": {
+    "hyphae": {
+      "command": "python",
+      "args": ["-m", "hyphae.mcp_server"],
+      "env": {}
+    }
+  }
+}
+```
+
+### MCP Tools
+
+| Tool | Description |
+|------|-------------|
+| `recall_memory(query, top_k)` | Search memory for relevant facts. Scoped to current project by default. Use when past context would help - errors seen before, decisions made, architecture details. |
+| `remember_fact(text, source)` | Save a fact to memory. Auto-tagged with current project. Use for decisions, discoveries, solutions, preferences. |
+| `recall_all_projects(query, top_k)` | Search across ALL projects (unscoped). Use when you don't know which project something is in, or for cross-project questions. |
+| `memory_status()` | Check if Hyphae is running, how many facts/clusters exist, manifold coverage. |
+
+### How the agent should use it
+
+- **On session start:** `recall_memory("what was done last session")` to get context
+- **When encountering a problem:** `recall_memory("specific error message or topic")` to check if it's been solved before
+- **After making decisions:** `remember_fact("decided to use X because Y")`
+- **After solving problems:** `remember_fact("the fix for X was Y")`
+- **When user corrects you:** `remember_fact("user prefers X over Y because Z")`
 
 ## Architecture
 
@@ -97,24 +253,6 @@ At recall time, results from clusters with manifolds get re-ranked by blending c
 
 See the paper: [Geodesic Retrieval over Learned Manifolds](https://zenodo.org/records/18971939) (DOI: 10.5281/zenodo.18971939)
 
-## MCP Server (Claude Code integration)
-
-Add to your Claude Code MCP config:
-
-```json
-{
-  "mcpServers": {
-    "hyphae": {
-      "command": "python",
-      "args": ["-m", "hyphae.mcp_server"],
-      "env": {}
-    }
-  }
-}
-```
-
-This gives Claude Code tools: `recall_memory`, `remember_fact`, `recall_all_projects`, `memory_status`, `learn_topic`.
-
 ## Configuration
 
 Hyphae stores its database at `~/.hyphae/hyphae.db` by default. Override with:
@@ -134,7 +272,7 @@ h = Hyphae(model="all-MiniLM-L6-v2")
 
 ### Remote shards
 
-Connect to external knowledge stores (e.g., Memoria):
+Connect to external knowledge stores:
 
 ```python
 h = Hyphae(remote_shards=[

@@ -18,7 +18,7 @@ from .cluster import ClusterEngine
 from .river import RiverManager
 from . import gaps as gap_engine
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"
 
 logger = logging.getLogger("hyphae")
 
