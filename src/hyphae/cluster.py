@@ -19,10 +19,9 @@ from .types import ClusterState, Fact
 logger = logging.getLogger("hyphae.cluster")
 
 K_NEIGHBORS = 15   # k-NN for manifold construction
-MIN_MANIFOLD = 15  # minimum facts before computing manifold (Gap 1: lowered from 30)
+MIN_MANIFOLD = 30  # minimum facts before computing manifold
 MANIFOLD_DIM = 12  # diffusion map dimensions
-DIRTY_THRESHOLD = 50  # recompute manifold after this many Nystrom extensions
-DIFFUSION_TIME = 3  # eigenvalue exponent — t=3 emphasizes global topology (Gap 6)
+DIRTY_THRESHOLD = 50  # recompute manifold after this many new facts
 
 
 class ClusterEngine:
@@ -30,8 +29,8 @@ class ClusterEngine:
 
     def __init__(
         self,
-        sim_threshold: float = 0.45,
-        merge_threshold: float = 0.75,
+        sim_threshold: float = 0.55,
+        merge_threshold: float = 0.85,
     ):
         self.sim_threshold = sim_threshold
         self.merge_threshold = merge_threshold
@@ -104,57 +103,9 @@ class ClusterEngine:
 
         cluster.fact_ids.append(fact.id)
         cluster.count += 1
-
-        # Nystrom extension: extend existing manifold cheaply instead of marking dirty
-        if cluster.manifold_coords is not None and not cluster.dirty:
-            self.nystrom_extend(cluster_id, embedding)
-        else:
-            cluster.dirty = True
+        cluster.dirty = True
 
         return cluster_id
-
-    def nystrom_extend(self, cluster_id: int, new_embedding: np.ndarray) -> bool:
-        """Extend an existing manifold to include a new point via k-NN interpolation.
-
-        Avoids a full eigenvector recompute for every new fact — instead projects
-        the new point into manifold space using a weighted average of its k-NN
-        neighbors' manifold coordinates. (Gap 4)
-        """
-        cluster = self.clusters.get(cluster_id)
-        if cluster is None or cluster.manifold_coords is None or cluster.local_embeddings is None:
-            return False
-
-        n = len(cluster.local_embeddings)
-        k = min(K_NEIGHBORS, n)
-        if k == 0:
-            return False
-
-        sims = cluster.local_embeddings @ new_embedding
-        top_k_idx = np.argpartition(-sims, k)[:k]
-
-        distances = 1.0 - sims[top_k_idx]
-        sigma = float(np.median(distances)) if len(distances) > 0 else 0.5
-        sigma = max(sigma, 1e-6)
-        weights = np.exp(-(distances ** 2) / (2 * sigma ** 2))
-        weight_sum = weights.sum()
-        if weight_sum < 1e-10:
-            return False
-        weights /= weight_sum
-
-        new_coords = np.zeros(cluster.manifold_coords.shape[1])
-        for i, idx in enumerate(top_k_idx):
-            if idx < len(cluster.manifold_coords):
-                new_coords += weights[i] * cluster.manifold_coords[idx]
-
-        cluster.manifold_coords = np.vstack([cluster.manifold_coords, new_coords])
-        cluster.local_embeddings = np.vstack([cluster.local_embeddings, new_embedding])
-        cluster.nystrom_extensions = getattr(cluster, "nystrom_extensions", 0) + 1
-
-        if cluster.nystrom_extensions >= DIRTY_THRESHOLD:
-            cluster.dirty = True  # schedule full recompute
-            cluster.nystrom_extensions = 0
-
-        return True
 
     def _create_cluster(self, embedding: np.ndarray) -> int:
         """Spawn a new cluster centered on this embedding."""
@@ -253,18 +204,10 @@ class ClusterEngine:
         # k-NN similarity matrix
         sims = embeddings @ embeddings.T  # cosine sim (already normalized)
 
-        # Local scaling per point — Zelnik-Manor & Perona (Gap 3)
-        # sigma_i = distance to median k-NN neighbor
-        sigmas = np.ones(n) * 0.5  # fallback
+        # Build sparse affinity matrix from k-NN
+        rows, cols, vals = [], [], []
         for i in range(n):
-            distances = np.sort(1.0 - sims[i])
-            knn_dists = distances[1:k + 1]  # skip self (dist=0)
-            mid = max(0, len(knn_dists) // 2 - 1)
-            sigmas[i] = max(knn_dists[mid], 1e-6)
-
-        # Build sparse affinity matrix with local scaling
-        rows_idx, cols_idx, vals = [], [], []
-        for i in range(n):
+            # Top-k neighbors (excluding self)
             neighbors = np.argsort(-sims[i])
             count = 0
             for j in neighbors:
@@ -272,53 +215,26 @@ class ClusterEngine:
                     continue
                 if count >= k:
                     break
-                d = 1.0 - float(sims[i, j])
-                w = float(np.exp(-d * d / (2.0 * sigmas[i] * sigmas[j])))
-                rows_idx.append(i)
-                cols_idx.append(j)
+                # Gaussian kernel on cosine distance
+                d = 1.0 - sims[i, j]
+                sigma = 0.5  # bandwidth
+                w = float(np.exp(-d * d / (2 * sigma * sigma)))
+                rows.append(i)
+                cols.append(j)
                 vals.append(w)
-                rows_idx.append(j)
-                cols_idx.append(i)
+                # Symmetrize
+                rows.append(j)
+                cols.append(i)
                 vals.append(w)
                 count += 1
 
-        W_dense = np.zeros((n, n), dtype=np.float32)
-        for ri, ci, v in zip(rows_idx, cols_idx, vals):
-            W_dense[ri, ci] = max(W_dense[ri, ci], v)
-
-        # Causal link boosting — strengthen affinity along causal edges (Gap 5)
-        fid_to_idx = {fid: i for i, fid in enumerate(fact_ids)}
-        try:
-            links = shard.get_causal_links_for_cluster(cluster_id)
-            for from_id, to_id, confidence in links:
-                i = fid_to_idx.get(from_id)
-                j = fid_to_idx.get(to_id)
-                if i is not None and j is not None:
-                    boost = 2.0 * confidence
-                    W_dense[i, j] *= boost
-                    W_dense[j, i] *= boost
-        except Exception:
-            pass
-
-        # Co-occurrence boosting — facts recalled together are topologically closer
-        try:
-            co_pairs = shard.get_co_occurrences_for_cluster(cluster_id)
-            for id_a, id_b, co_count in co_pairs:
-                i = fid_to_idx.get(id_a)
-                j = fid_to_idx.get(id_b)
-                if i is not None and j is not None:
-                    boost = 1.0 + 0.5 * float(np.log1p(co_count)) / 5.0
-                    W_dense[i, j] *= boost
-                    W_dense[j, i] *= boost
-        except Exception:
-            pass
-
-        W = csr_matrix(W_dense)
+        W = csr_matrix((vals, (rows, cols)), shape=(n, n))
 
         # Normalized graph Laplacian: D^{-1/2} W D^{-1/2}
         D = np.array(W.sum(axis=1)).flatten()
         D[D < 1e-10] = 1e-10
         D_inv_sqrt = 1.0 / np.sqrt(D)
+        # Apply normalization
         W_norm = W.multiply(D_inv_sqrt[:, None]).multiply(D_inv_sqrt[None, :])
         W_norm = (W_norm + W_norm.T) / 2  # ensure symmetry
 
@@ -327,16 +243,22 @@ class ClusterEngine:
             eigenvalues, eigenvectors = eigsh(W_norm, k=dim + 1, which="LM")
         except Exception as e:
             logger.warning(f"Eigsh failed for cluster #{cluster_id}: {e}")
-            return False
+            # Fall back to raw embeddings so recall still works without manifold.
+            # Mark dirty=False so we don't retry on every query and peg the CPU.
+            cluster.manifold_coords = embeddings[:, :dim]
+            cluster.eigenvalues = np.ones(dim)
+            cluster.local_embeddings = embeddings
+            cluster.fact_ids = fact_ids
+            cluster.dirty = False
+            return True
 
         # Sort by eigenvalue descending, skip first
         order = np.argsort(-eigenvalues)
         eigenvalues = eigenvalues[order][1:dim + 1]
         eigenvectors = eigenvectors[:, order][:, 1:dim + 1]
 
-        # Diffusion time scaling: eigenvalues^t amplifies global topology (Gap 6)
-        scaled = eigenvalues ** DIFFUSION_TIME
-        coords = eigenvectors * scaled[None, :]
+        # Scale by eigenvalues for diffusion distance
+        coords = eigenvectors * eigenvalues[None, :]
 
         cluster.manifold_coords = coords
         cluster.eigenvalues = eigenvalues
