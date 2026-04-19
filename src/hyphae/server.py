@@ -84,6 +84,13 @@ class DistillRequest(BaseModel):
     project: str
 
 
+class CurateRequest(BaseModel):
+    project: str
+    dry_run: bool = False
+    force: bool = False
+    api_key: str = ""
+
+
 # --- Session management ---
 
 
@@ -290,6 +297,52 @@ def river_insert(req: InsertStoneRequest):
 def river_history(stone_id: str = "", river_id: str = ""):
     h = get_hyphae()
     return h.river_manager.history(stone_id, river_id)
+
+
+# --- Curation ---
+
+@app.post("/curate")
+def curate(req: CurateRequest):
+    """Haiku-powered memory curation for a project.
+
+    Reads all stored facts for the project, calls Haiku to:
+      1. Generate/update a living thesis (project direction summary)
+      2. Detect conflicting methods (old vs new HOW-TO procedures)
+      3. Identify stale facts for pruning
+
+    The thesis is stored as a pinned fact — it survives decay and is
+    injected at session start to anchor Claude's understanding of the project.
+
+    Respects a 6h cooldown per project. Use force=true to bypass.
+    """
+    from . import curate as curate_module
+    h = get_hyphae()
+    return curate_module.curate(
+        project=req.project,
+        shard=h.local_shard,
+        hyphae_instance=h,
+        api_key=req.api_key or None,
+        dry_run=req.dry_run,
+        force=req.force,
+    )
+
+
+@app.get("/curate/thesis/{project}")
+def get_thesis(project: str):
+    """Get the current thesis for a project."""
+    h = get_hyphae()
+    try:
+        rows = h.local_shard.conn.execute(
+            "SELECT text, created_at FROM facts "
+            "WHERE tags_json LIKE ? AND tags_json LIKE ? "
+            "ORDER BY created_at DESC LIMIT 1",
+            (f'%"project":"{project}"%', '%"type":"thesis"%'),
+        ).fetchall()
+        if rows:
+            return {"project": project, "thesis": rows[0]["text"], "created_at": rows[0]["created_at"]}
+    except Exception:
+        pass
+    return {"project": project, "thesis": None}
 
 
 # --- Maintenance ---
