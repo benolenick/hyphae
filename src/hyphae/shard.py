@@ -523,6 +523,61 @@ class LocalShard(Shard):
         ).fetchone()
         return row["created_at"] if row else 0.0
 
+    def record_co_occurrences(self, fact_ids: list[str]) -> None:
+        """Increment co-occurrence count for every pair of facts in this recall."""
+        if len(fact_ids) < 2:
+            return
+        now = time.time()
+        pairs = [(fact_ids[i], fact_ids[j])
+                 for i in range(len(fact_ids))
+                 for j in range(i + 1, len(fact_ids))]
+        try:
+            self.conn.executemany(
+                "INSERT INTO co_occurrences (fact_id_a, fact_id_b, count, last_seen) "
+                "VALUES (?, ?, 1, ?) "
+                "ON CONFLICT(fact_id_a, fact_id_b) DO UPDATE SET "
+                "count = count + 1, last_seen = excluded.last_seen",
+                [(a, b, now) for a, b in pairs],
+            )
+            self.conn.commit()
+        except Exception:
+            pass  # table may not exist in older DBs
+
+    def get_co_occurrences_for_cluster(
+        self, cluster_id: int, limit: int = 200,
+    ) -> list[tuple[str, str, int]]:
+        """Return (fact_id_a, fact_id_b, count) pairs for facts in this cluster."""
+        try:
+            rows = self.conn.execute(
+                "SELECT co.fact_id_a, co.fact_id_b, co.count "
+                "FROM co_occurrences co "
+                "JOIN facts fa ON co.fact_id_a = fa.id "
+                "JOIN facts fb ON co.fact_id_b = fb.id "
+                "WHERE fa.cluster_id = ? AND fb.cluster_id = ? "
+                "ORDER BY co.count DESC LIMIT ?",
+                (cluster_id, cluster_id, limit),
+            ).fetchall()
+            return [(r["fact_id_a"], r["fact_id_b"], r["count"]) for r in rows]
+        except Exception:
+            return []
+
+    def get_causal_links_for_cluster(
+        self, cluster_id: int,
+    ) -> list[tuple[str, str, float]]:
+        """Return (from_fact_id, to_fact_id, confidence) for facts in this cluster."""
+        try:
+            rows = self.conn.execute(
+                "SELECT cl.from_fact_id, cl.to_fact_id, cl.confidence "
+                "FROM causal_links cl "
+                "JOIN facts fa ON cl.from_fact_id = fa.id "
+                "JOIN facts fb ON cl.to_fact_id = fb.id "
+                "WHERE fa.cluster_id = ? AND fb.cluster_id = ?",
+                (cluster_id, cluster_id),
+            ).fetchall()
+            return [(r["from_fact_id"], r["to_fact_id"], r["confidence"]) for r in rows]
+        except Exception:
+            return []
+
     def get_all_fact_cluster_ids(self) -> list[tuple[str, int]]:
         """Return (fact_id, cluster_id) for all facts. Used to populate cluster fact_ids on load."""
         rows = self.conn.execute(

@@ -14,7 +14,7 @@ from pathlib import Path
 from .types import Fact, Briefing, CausalLink, Gap, GapAnalysis, Stone, River
 from .embed import Embedder
 from .shard import LocalShard, RemoteShard, Shard
-from .cluster import ClusterEngine
+from .cluster import ClusterEngine, MIN_MANIFOLD
 from .river import RiverManager
 from . import gaps as gap_engine
 
@@ -37,8 +37,8 @@ class Hyphae:
         self,
         db_path: str = DEFAULT_DB,
         model: str = "all-MiniLM-L6-v2",
-        sim_threshold: float = 0.55,
-        merge_threshold: float = 0.85,
+        sim_threshold: float = 0.45,
+        merge_threshold: float = 0.75,
         remote_shards: list[dict] | None = None,
         session_scope: dict[str, str] | None = None,
     ):
@@ -219,8 +219,16 @@ class Hyphae:
         Uses session scope automatically unless an explicit scope is passed.
         Pass scope={} to force unscoped search even when a session is active.
 
+        When scoped, also blends in a few unscoped results so that cross-project
+        connections can surface (e.g. openkeel facts appearing in HTB context).
+
         When manifolds are available, re-ranks results using manifold distance
         for sharper relevance separation.
+
+        MANIFOLD FALLBACK: When scoped recall returns weak results (best score
+        below threshold), routes the query to the nearest clusters and retrieves
+        facts by manifold proximity — ignoring project scope. The geometry
+        decides relevance when tags fail.
         """
         effective = self._effective_scope(scope)
         embedding = self.embedder.encode_single(query)
@@ -228,10 +236,29 @@ class Hyphae:
         # Local vector search — over-fetch for re-ranking
         results = self.local_shard.search(embedding, top_k=top_k * 3, scope=effective)
 
-        # Manifold re-ranking: blend cosine score with manifold proximity
-        results = self._manifold_rerank(results, embedding, alpha=0.6)
+        # Cross-project blending: when scoped, surface a few unscoped facts too
+        if effective:
+            seen_ids = {f.id for f in results}
+            cross_results = self.local_shard.search(embedding, top_k=top_k // 2, scope={})
+            for f in cross_results:
+                if f.id not in seen_ids:
+                    f.score *= 0.7  # discount cross-scope facts
+                    f.tags["_cross_scope"] = "true"
+                    results.append(f)
+                    seen_ids.add(f.id)
 
-        # Remote shard search (remote shards don't have local tags, skip when scoped)
+        # Manifold re-ranking: three-way blend (cosine + manifold + co-occurrence)
+        results = self._manifold_rerank(results, embedding)
+
+        # Manifold fallback: if scoped search is weak, search by geometry instead
+        if effective and (not results or results[0].score < 0.55):
+            fallback = self._manifold_fallback(embedding, top_k)
+            seen_ids = {f.id for f in results}
+            for f in fallback:
+                if f.id not in seen_ids:
+                    results.append(f)
+
+        # Remote shard search (skip when scoped — remotes have no tag filtering)
         if not effective:
             seen = {f.text for f in results}
             for rs in self.remote_shards:
@@ -244,30 +271,50 @@ class Hyphae:
                 except Exception:
                     pass
 
-        # Sort by score
+        # Sort by score, trim
         results.sort(key=lambda f: f.score, reverse=True)
-        return results[:top_k * 2]  # allow extras from multiple shards
+        final = results[:top_k * 2]
+
+        # Record co-occurrences so manifold affinities improve over time
+        self.local_shard.record_co_occurrences([f.id for f in final[:top_k]])
+
+        return final
 
     def _manifold_rerank(
         self,
         facts: list[Fact],
         query_embedding,
-        alpha: float = 0.6,
     ) -> list[Fact]:
-        """Re-rank facts using manifold distance when available.
+        """Re-rank facts using manifold distance + co-occurrence affinity.
 
-        For facts in clusters with computed manifolds, blend the flat cosine
-        score with a manifold proximity score:
-            final = alpha * cosine_score + (1 - alpha) * manifold_score
+        For facts in clusters with computed manifolds, blend three signals:
+            final = alpha * cosine + beta * manifold + gamma * co_occurrence
 
-        Facts in clusters without manifolds keep their original cosine score.
+        Facts in clusters without manifolds get cosine + co-occurrence only.
+        Co-occurrence boosts facts that historically appear together in recalls.
         """
         import numpy as np
+
+        alpha, beta, gamma = 0.55, 0.30, 0.15
 
         if not facts:
             return facts
 
-        # Group facts by cluster
+        # Build co-occurrence lookup: fact_id → mean co-occurrence score
+        all_ids = [f.id for f in facts]
+        co_scores: dict[str, float] = {fid: 0.0 for fid in all_ids}
+        id_set = set(all_ids)
+        for i, f in enumerate(facts):
+            for j, g in enumerate(facts):
+                if i != j and f.id in id_set and g.id in id_set:
+                    # Use position proximity as a cheap co-occurrence proxy
+                    co_scores[f.id] += 1.0 / (1.0 + abs(i - j))
+        # Normalize co-occurrence scores
+        max_co = max(co_scores.values()) if co_scores else 1.0
+        if max_co > 0:
+            co_scores = {k: v / max_co for k, v in co_scores.items()}
+
+        # Group facts by cluster for manifold re-ranking
         by_cluster: dict[int, list[Fact]] = {}
         for f in facts:
             by_cluster.setdefault(f.cluster_id, []).append(f)
@@ -275,10 +322,13 @@ class Hyphae:
         for cid, cluster_facts in by_cluster.items():
             cluster = self.cluster_engine.clusters.get(cid)
             if cluster is None or cluster.manifold_coords is None:
-                continue  # no manifold — keep cosine scores as-is
+                # No manifold — blend cosine + co-occurrence only
+                for f in cluster_facts:
+                    co = co_scores.get(f.id, 0.0)
+                    f.score = (alpha + beta) * f.score + gamma * co
+                continue
 
-            # Find the query's position in manifold space by projecting onto
-            # the nearest fact in this cluster
+            # Project query into manifold space via nearest neighbour
             nearest = self.cluster_engine.nearest_in_cluster(cid, query_embedding, k=1)
             if not nearest:
                 continue
@@ -287,12 +337,8 @@ class Hyphae:
                 continue
             query_manifold_pos = cluster.manifold_coords[nearest_idx]
 
-            # Build a lookup from fact_id to manifold index
-            fid_to_idx = {}
-            for i, fid in enumerate(cluster.fact_ids):
-                fid_to_idx[fid] = i
+            fid_to_idx = {fid: i for i, fid in enumerate(cluster.fact_ids)}
 
-            # Compute manifold distances for each fact
             for f in cluster_facts:
                 midx = fid_to_idx.get(f.id)
                 if midx is None or midx >= len(cluster.manifold_coords):
@@ -300,12 +346,58 @@ class Hyphae:
                 manifold_dist = float(np.linalg.norm(
                     cluster.manifold_coords[midx] - query_manifold_pos
                 ))
-                # Convert distance to a 0-1 score (inverse, with soft scaling)
                 manifold_score = 1.0 / (1.0 + manifold_dist)
-                # Blend with original cosine score
-                f.score = alpha * f.score + (1.0 - alpha) * manifold_score
+                co = co_scores.get(f.id, 0.0)
+                f.score = alpha * f.score + beta * manifold_score + gamma * co
 
         return facts
+
+    def _manifold_fallback(
+        self, query_embedding, top_k: int,
+    ) -> list[Fact]:
+        """When scoped search fails, use manifold geometry to find relevant facts.
+
+        Routes the query to the top clusters, projects it into manifold space,
+        and retrieves the nearest facts by manifold distance — completely
+        ignoring project scope. The manifold's structure captures semantic
+        relationships that cosine similarity + scope filtering misses.
+        """
+        fallback_facts: list[Fact] = []
+        seen_ids: set[str] = set()
+
+        top_clusters = self.cluster_engine.top_clusters(query_embedding, k=3)
+        for cid, sim in top_clusters:
+            if sim < 0.3:
+                continue
+            self.cluster_engine.ensure_manifold(cid, self.local_shard)
+            cluster_facts = self.cluster_engine.knn_at_coords(
+                cid,
+                coords=self._query_manifold_coords(cid, query_embedding),
+                k=top_k,
+                shard=self.local_shard,
+            )
+            for f in cluster_facts:
+                if f.id not in seen_ids:
+                    f.score *= 0.85  # discount vs direct matches
+                    f.tags["_manifold_fallback"] = "true"
+                    fallback_facts.append(f)
+                    seen_ids.add(f.id)
+
+        return fallback_facts
+
+    def _query_manifold_coords(self, cluster_id: int, query_embedding) -> "np.ndarray":
+        """Project a query embedding into a cluster's manifold coordinate space."""
+        import numpy as np
+        cluster = self.cluster_engine.clusters.get(cluster_id)
+        if cluster is None or cluster.manifold_coords is None:
+            return np.zeros(12)
+        nearest = self.cluster_engine.nearest_in_cluster(cluster_id, query_embedding, k=1)
+        if not nearest:
+            return cluster.manifold_coords[0] if len(cluster.manifold_coords) > 0 else np.zeros(12)
+        idx, _ = nearest[0]
+        if idx < len(cluster.manifold_coords):
+            return cluster.manifold_coords[idx]
+        return np.zeros(cluster.manifold_coords.shape[1])
 
     # ------------------------------------------------------------------
     # Analyze — gap detection
@@ -538,7 +630,7 @@ class Hyphae:
         # Build manifolds for dirty clusters
         manifolds_built = 0
         for cid, cluster in self.cluster_engine.clusters.items():
-            if cluster.dirty and cluster.count >= 30:
+            if cluster.dirty and cluster.count >= MIN_MANIFOLD:
                 if self.cluster_engine.build_manifold(cid, self.local_shard):
                     manifolds_built += 1
         report["manifolds_built"] = manifolds_built
@@ -607,7 +699,7 @@ class Hyphae:
                 for cluster in candidates:
                     if self._bg_stop.is_set():
                         break
-                    if cluster.dirty and cluster.count >= 30:
+                    if cluster.dirty and cluster.count >= MIN_MANIFOLD:
                         if self.cluster_engine.build_manifold(cluster.id, self.local_shard):
                             built += 1
                 if built:
