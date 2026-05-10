@@ -26,7 +26,6 @@ class Fact:
     last_accessed_at: float = 0.0
     access_count: int = 0
     score: float = 0.0  # relevance score from search
-    superseded_by: str | None = None  # fact_id that replaces this one; excluded from recall when set
 
     def __post_init__(self):
         if not self.id:

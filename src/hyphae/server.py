@@ -186,7 +186,7 @@ def recall(req: RecallRequest):
     facts = h.recall(req.query, top_k=req.top_k, scope=req.scope)
     return {
         "results": [
-            {"text": f.text, "score": f.score, "cluster_id": f.cluster_id,
+            {"id": f.id, "text": f.text, "score": f.score, "cluster_id": f.cluster_id,
              "source": f.source, "tags": f.tags}
             for f in facts
         ]
