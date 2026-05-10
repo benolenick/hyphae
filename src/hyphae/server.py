@@ -32,6 +32,7 @@ class RememberRequest(BaseModel):
     tags: dict[str, str] = Field(default_factory=dict)
     source: str = ""
     cause_of: str = ""  # fact ID this was caused by
+    supersedes: list[str] = Field(default_factory=list)  # fact IDs this replaces
 
 
 class RecallRequest(BaseModel):
@@ -167,6 +168,7 @@ def remember(req: RememberRequest):
         tags=req.tags,
         source=req.source,
         cause_of=req.cause_of,
+        supersedes=req.supersedes,
     )
     # Tower organic growth — check if this fact belongs near a tower
     try:
@@ -175,8 +177,7 @@ def remember(req: RememberRequest):
     except Exception:
         pass
 
-
-    return {"fact_id": fact_id, "cluster_id": cluster_id}
+    return {"fact_id": fact_id, "cluster_id": cluster_id, "superseded": len(req.supersedes)}
 
 
 @app.post("/recall")

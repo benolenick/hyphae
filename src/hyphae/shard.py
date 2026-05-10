@@ -9,6 +9,7 @@ import json
 import logging
 import math
 import sqlite3
+import threading
 import time
 from abc import ABC, abstractmethod
 from pathlib import Path
@@ -105,6 +106,7 @@ class LocalShard(Shard):
         self.db_path = db_path
         self.conn = sqlite3.connect(db_path, check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
+        self._db_lock = threading.RLock()
         self._init_schema()
         self._faiss_index = None
         self._faiss_ids: list[str] = []
@@ -172,6 +174,7 @@ class LocalShard(Shard):
         # Migrate existing DBs: add columns if missing
         self._migrate_add_column("facts", "last_accessed_at", "REAL DEFAULT 0")
         self._migrate_add_column("facts", "access_count", "INTEGER DEFAULT 0")
+        self._migrate_add_column("facts", "superseded_by", "TEXT DEFAULT NULL")
         self.conn.commit()
 
     def _migrate_add_column(self, table: str, column: str, col_type: str):
@@ -191,9 +194,10 @@ class LocalShard(Shard):
             self._faiss_index = None
             return
 
-        rows = self.conn.execute(
-            "SELECT fact_id, data, dim FROM embeddings"
-        ).fetchall()
+        with self._db_lock:
+            rows = self.conn.execute(
+                "SELECT fact_id, data, dim FROM embeddings"
+            ).fetchall()
 
         if not rows:
             dim = 384  # default
@@ -222,6 +226,10 @@ class LocalShard(Shard):
 
     def store(self, fact: Fact) -> str:
         """Store fact + embedding. Deduplicates by content hash ID."""
+        with self._db_lock:
+            return self._store_locked(fact)
+
+    def _store_locked(self, fact: Fact) -> str:
         # Check for duplicate
         existing = self.conn.execute(
             "SELECT id FROM facts WHERE id = ?", (fact.id,)
@@ -253,19 +261,21 @@ class LocalShard(Shard):
 
     def store_link(self, link: CausalLink) -> None:
         """Store a causal link between facts."""
-        self.conn.execute(
-            "INSERT INTO causal_links (from_fact_id, to_fact_id, relation, context_id, confidence) "
-            "VALUES (?, ?, ?, ?, ?)",
-            (link.from_fact_id, link.to_fact_id, link.relation,
-             link.context_id, link.confidence),
-        )
-        self.conn.commit()
+        with self._db_lock:
+            self.conn.execute(
+                "INSERT INTO causal_links (from_fact_id, to_fact_id, relation, context_id, confidence) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (link.from_fact_id, link.to_fact_id, link.relation,
+                 link.context_id, link.confidence),
+            )
+            self.conn.commit()
 
     def get_links(self, fact_id: str) -> list[CausalLink]:
         """Get all causal links involving a fact."""
-        rows = self.conn.execute(
-            "SELECT * FROM causal_links WHERE from_fact_id = ? OR to_fact_id = ?",
-            (fact_id, fact_id),
+        with self._db_lock:
+            rows = self.conn.execute(
+                "SELECT * FROM causal_links WHERE from_fact_id = ? OR to_fact_id = ?",
+                (fact_id, fact_id),
         ).fetchall()
         return [
             CausalLink(
@@ -310,6 +320,8 @@ class LocalShard(Shard):
                     continue
                 fact = self.get(self._faiss_ids[idx])
                 if fact:
+                    if fact.superseded_by:
+                        continue
                     if scope and not _tags_match(fact.tags, scope):
                         continue
                     fact.score = _decay_score(
@@ -347,6 +359,8 @@ class LocalShard(Shard):
         for idx in top_idx:
             fact = self.get(ids[idx])
             if fact:
+                if fact.superseded_by:
+                    continue
                 if scope and not _tags_match(fact.tags, scope):
                     continue
                 fact.score = _decay_score(
@@ -363,17 +377,19 @@ class LocalShard(Shard):
 
     def text_search(self, query: str, top_k: int = 10) -> list[Fact]:
         """FTS5 keyword search fallback."""
-        rows = self.conn.execute(
-            "SELECT f.* FROM facts f JOIN facts_fts fts ON f.rowid = fts.rowid "
-            "WHERE facts_fts MATCH ? ORDER BY rank LIMIT ?",
-            (query, top_k),
-        ).fetchall()
+        with self._db_lock:
+            rows = self.conn.execute(
+                "SELECT f.* FROM facts f JOIN facts_fts fts ON f.rowid = fts.rowid "
+                "WHERE facts_fts MATCH ? ORDER BY rank LIMIT ?",
+                (query, top_k),
+            ).fetchall()
         return [self._row_to_fact(r) for r in rows]
 
     def get(self, fact_id: str) -> Fact | None:
-        row = self.conn.execute(
-            "SELECT * FROM facts WHERE id = ?", (fact_id,)
-        ).fetchone()
+        with self._db_lock:
+            row = self.conn.execute(
+                "SELECT * FROM facts WHERE id = ?", (fact_id,)
+            ).fetchone()
         if not row:
             return None
         return self._row_to_fact(row)
@@ -389,6 +405,7 @@ class LocalShard(Shard):
             created_at=row["created_at"],
             last_accessed_at=row["last_accessed_at"] or 0.0,
             access_count=row["access_count"] or 0,
+            superseded_by=row["superseded_by"] if "superseded_by" in row.keys() else None,
         )
 
     def bump_access(self, fact_ids: list[str]) -> None:
@@ -396,12 +413,28 @@ class LocalShard(Shard):
         if not fact_ids:
             return
         now = time.time()
-        self.conn.executemany(
-            "UPDATE facts SET last_accessed_at = ?, access_count = access_count + 1 "
-            "WHERE id = ?",
-            [(now, fid) for fid in fact_ids],
-        )
-        self.conn.commit()
+        with self._db_lock:
+            self.conn.executemany(
+                "UPDATE facts SET last_accessed_at = ?, access_count = access_count + 1 "
+                "WHERE id = ?",
+                [(now, fid) for fid in fact_ids],
+            )
+            self.conn.commit()
+
+    def supersede(self, fact_ids: list[str], by_fact_id: str) -> int:
+        """Mark facts as superseded. They will be excluded from all future recalls.
+        Returns the number of facts actually updated."""
+        if not fact_ids:
+            return 0
+        with self._db_lock:
+            self.conn.executemany(
+                "UPDATE facts SET superseded_by = ? WHERE id = ? AND superseded_by IS NULL",
+                [(by_fact_id, fid) for fid in fact_ids],
+            )
+            self.conn.commit()
+            return self.conn.execute(
+                f"SELECT changes()"
+            ).fetchone()[0]
 
     def update_cluster_id(self, fact_id: str, cluster_id: int) -> None:
         self.conn.execute(
@@ -430,13 +463,15 @@ class LocalShard(Shard):
         return ids, np.stack(vecs)
 
     def count(self) -> int:
-        row = self.conn.execute("SELECT COUNT(*) as c FROM facts").fetchone()
+        with self._db_lock:
+            row = self.conn.execute("SELECT COUNT(*) as c FROM facts").fetchone()
         return row["c"]
 
     def all_embeddings(self) -> tuple[list[str], np.ndarray]:
-        rows = self.conn.execute(
-            "SELECT fact_id, data FROM embeddings"
-        ).fetchall()
+        with self._db_lock:
+            rows = self.conn.execute(
+                "SELECT fact_id, data FROM embeddings"
+            ).fetchall()
         if not rows:
             return [], np.array([])
         ids = [r["fact_id"] for r in rows]

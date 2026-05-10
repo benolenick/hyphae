@@ -144,6 +144,7 @@ class Hyphae:
         tags: dict[str, str] | None = None,
         source: str = "",
         cause_of: str = "",
+        supersedes: list[str] | None = None,
     ) -> tuple[str, int]:
         """Store a fact. Returns (fact_id, cluster_id).
 
@@ -176,6 +177,10 @@ class Hyphae:
         # Persist
         self.local_shard.store(fact)
         self.local_shard.update_cluster_id(fact.id, cluster_id)
+
+        # Tombstone superseded facts
+        if supersedes:
+            self.local_shard.supersede(supersedes, fact.id)
 
         # Save causal link if specified
         if cause_of:
